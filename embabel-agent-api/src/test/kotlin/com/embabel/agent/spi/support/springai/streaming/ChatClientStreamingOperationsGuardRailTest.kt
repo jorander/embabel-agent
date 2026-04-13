@@ -26,6 +26,7 @@ import com.embabel.agent.core.LlmInvocation
 import com.embabel.agent.core.LlmInvocationHistory
 import com.embabel.agent.core.ProcessContext
 import com.embabel.agent.core.support.LlmInteraction
+import com.embabel.agent.spi.streaming.StreamingLlmOperations
 import com.embabel.agent.spi.support.DefaultToolDecorator
 import com.embabel.agent.spi.support.LlmDataBindingProperties
 import com.embabel.agent.spi.support.RegistryToolGroupResolver
@@ -120,12 +121,12 @@ class StreamingGuardRailTestFakeChatModel(
 }
 
 /**
- * Tests for guardrail validation in StreamingChatClientOperations
+ * Tests for guardrail validation in streaming operations in ChatClientLlmOperations
  */
-class StreamingChatClientOperationsGuardRailTest {
+class ChatClientStreamingOperationsGuardRailTest {
 
     internal data class Setup(
-        val streamingOperations: StreamingChatClientOperations,
+        val streamingOperations: StreamingLlmOperations,
         val mockAgentProcess: AgentProcess,
         val mutableLlmInvocationHistory: StreamingGuardRailTestMutableLlmInvocationHistory,
     )
@@ -172,8 +173,7 @@ class StreamingChatClientOperationsGuardRailTest {
             dataBindingProperties = dataBindingProperties,
             asyncer = com.embabel.agent.spi.support.ExecutorAsyncer(java.util.concurrent.Executors.newCachedThreadPool()),
         )
-        val streamingOperations = StreamingChatClientOperations(cco)
-        return Setup(streamingOperations, mockAgentProcess, mutableLlmInvocationHistory)
+        return Setup(cco, mockAgentProcess, mutableLlmInvocationHistory)
     }
 
     @Test

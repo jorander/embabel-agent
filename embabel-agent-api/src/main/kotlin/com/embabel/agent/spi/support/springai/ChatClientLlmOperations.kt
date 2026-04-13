@@ -16,6 +16,8 @@
 package com.embabel.agent.spi.support.springai
 
 import com.embabel.agent.api.common.Asyncer
+import com.embabel.agent.api.common.InteractionId
+import com.embabel.agent.spi.streaming.StreamingCapabilityDetector
 import com.embabel.agent.api.event.LlmRequestEvent
 import com.embabel.agent.api.tool.Tool
 import com.embabel.agent.api.tool.config.ToolLoopConfiguration
@@ -29,20 +31,25 @@ import com.embabel.agent.spi.ToolDecorator
 import com.embabel.agent.spi.loop.AutoCorrectionPolicy
 import com.embabel.agent.spi.loop.LlmMessageSender
 import com.embabel.agent.spi.loop.ToolLoopFactory
+import com.embabel.agent.spi.loop.streaming.LlmMessageStreamer
 import com.embabel.agent.spi.support.LlmDataBindingProperties
 import com.embabel.agent.spi.support.LlmOperationsPromptsProperties
 import com.embabel.agent.spi.support.MaybeReturn
 import com.embabel.agent.spi.support.OutputConverter
+import com.embabel.agent.spi.support.PROMPT_ELEMENT_SEPARATOR
 import com.embabel.agent.spi.support.ToolLoopLlmOperations
 import com.embabel.agent.spi.support.ToolResolutionHelper
 import com.embabel.agent.spi.support.guardrails.validateAssistantResponse
 import com.embabel.agent.spi.support.guardrails.validateUserInput
+import com.embabel.agent.spi.support.springai.streaming.SpringAiLlmMessageStreamer
 import com.embabel.agent.spi.validation.DefaultValidationPromptGenerator
 import com.embabel.agent.spi.validation.ValidationPromptGenerator
 import com.embabel.chat.Message
 import com.embabel.common.ai.converters.FilteringJacksonOutputConverter
+import com.embabel.common.ai.converters.streaming.StreamingJacksonOutputConverter
 import com.embabel.common.ai.model.LlmOptions
 import com.embabel.common.ai.model.ModelProvider
+import com.embabel.common.core.streaming.StreamingEvent
 import com.embabel.common.core.thinking.ThinkingException
 import com.embabel.common.core.thinking.ThinkingResponse
 import com.embabel.common.core.thinking.spi.InternalThinkingApi
@@ -75,6 +82,8 @@ import org.springframework.context.ApplicationContext
 import org.springframework.core.ParameterizedTypeReference
 import org.springframework.retry.support.RetrySynchronizationManager
 import org.springframework.stereotype.Service
+import reactor.core.publisher.Flux
+import reactor.core.publisher.Mono
 
 // Log message constants to avoid duplication
 private const val LLM_TIMEOUT_MESSAGE = "LLM {}: attempt {} timed out after {}ms"
@@ -93,6 +102,7 @@ private const val LLM_INTERRUPTED_MESSAGE = "LLM {}: attempt {} was interrupted"
  * @param toolDecorator ToolDecorator to decorate tools to make them aware of platform
  * @param templateRenderer TemplateRenderer to render templates
  * @param dataBindingProperties properties
+ * @param useMessageStreamer When true, delegates raw streaming to [LlmMessageStreamer] instead of calling Spring AI ChatClient directly. This decouples streaming from Spring AI, enabling vendor-neutral implementations.
  */
 @ThreadSafe
 @Service
@@ -111,6 +121,7 @@ internal class ChatClientLlmOperations(
     private val customizers: List<ChatClientCustomizer> = emptyList(),
     asyncer: Asyncer,
     toolLoopFactory: ToolLoopFactory = ToolLoopFactory.create(ToolLoopConfiguration(), asyncer, AutoCorrectionPolicy()),
+    private val useMessageStreamer: Boolean = false,
 ) : ToolLoopLlmOperations(
     toolDecorator = toolDecorator,
     modelProvider = modelProvider,
@@ -124,7 +135,7 @@ internal class ChatClientLlmOperations(
     toolLoopFactory = toolLoopFactory,
     asyncer = asyncer,
     templateRenderer = templateRenderer,
-) {
+), LlmOperationsIncludingStreaming {
 
     @PostConstruct
     private fun logPropertyConfiguration() {
@@ -578,10 +589,7 @@ internal class ChatClientLlmOperations(
         }
     }
 
-    /**
-     * Expose LLM selection for streaming operations
-     */
-    internal fun getLlm(interaction: LlmInteraction): LlmService<*> = chooseLlm(interaction.llm)
+    private fun getLlm(interaction: LlmInteraction): LlmService<*> = chooseLlm(interaction.llm)
 
     /**
      * Require the LLM to be a SpringAiLlm for Spring AI specific operations.
@@ -604,7 +612,7 @@ internal class ChatClientLlmOperations(
      * @param llm the LLM service to create a client for
      * @param llmRequestEvent optional domain context; when present, enables instrumentation
      */
-    internal fun createChatClient(
+    private fun createChatClient(
         llm: LlmService<*>,
         llmRequestEvent: LlmRequestEvent<*>? = null,
     ): ChatClient {
@@ -896,6 +904,359 @@ internal class ChatClientLlmOperations(
         action = action,
         toolDecorator = toolDecorator,
     )
+
+    override fun supportsStreaming(llmOptions: LlmOptions): Boolean {
+        val llm = getLlm(
+            LlmInteraction(
+                id = InteractionId("capability-check"),
+                llm = llmOptions
+            )
+        )
+        val springAiLlm = llm as? SpringAiLlmService ?: return false
+        return StreamingCapabilityDetector.supportsStreaming(springAiLlm.chatModel)
+    }
+
+    override fun doTransformStream(
+        messages: List<Message>,
+        interaction: LlmInteraction,
+        llmRequestEvent: LlmRequestEvent<String>?,
+        agentProcess: AgentProcess?,
+        action: Action?,
+    ): Flux<String> {
+        // Use ChatClientLlmOperations to get LLM and create ChatClient
+        val llm = getLlm(interaction)
+        val chatClient = createChatClient(llm)
+
+        // Build prompt using helper methods
+        val promptContributions = buildPromptContributions(interaction, llm)
+        val springAiPrompt = buildBasicPrompt(promptContributions, messages)
+
+        // Guardrails: Pre-validation of user input
+        val userMessages = messages.filterIsInstance<com.embabel.chat.UserMessage>()
+        validateUserInput(userMessages, interaction, llmRequestEvent?.agentProcess?.blackboard)
+
+        val chatOptions = requireSpringAiLlm(llm).optionsConverter.convertOptions(interaction.llm)
+
+        // Resolve tool groups and decorate tools
+        val tools = resolveAndDecorateTools(interaction, agentProcess, action)
+
+        return createStreamInternal(
+            chatClient = chatClient,
+            messages = messages,
+            promptContributions = promptContributions,
+            tools = tools,
+            chatOptions = chatOptions,
+            springAiPrompt = springAiPrompt,
+        )
+    }
+
+    /**
+     * Creates a stream of typed objects from LLM JSONL responses, with thinking content suppressed.
+     *
+     * This method provides a clean object-only stream by filtering the internal unified stream
+     * to exclude thinking content and extract only typed objects.
+     *
+     * **Stream Characteristics:**
+     * - **Input**: Raw LLM chunks containing JSONL + thinking content
+     * - **Processing**: Chunks → Lines → Events → Objects (thinking filtered out)
+     * - **Output**: `Flux<O>` containing only parsed typed objects
+     * - **Error Handling**: Malformed JSON is skipped; stream continues
+     * - **Backpressure**: Supports standard Flux operators and subscription patterns
+     *
+     * **Example Usage:**
+     * ```kotlin
+     * val objectStream: Flux<User> = doTransformObjectStream(messages, interaction, User::class.java, null)
+     *
+     * objectStream
+     *     .doOnNext { user -> println("Received user: ${user.name}") }
+     *     .doOnError { error -> logger.error("Stream error", error) }
+     *     .doOnComplete { println("Stream completed") }
+     *     .subscribe()
+     * ```
+     *
+     * **Difference from doTransformObjectStreamWithThinking:**
+     * - This method: Returns `Flux<O>` with only objects (thinking suppressed)
+     * - WithThinking: Returns `Flux<StreamingEvent<O>>` with both thinking and objects
+     *
+     * @param messages The conversation messages to send to LLM
+     * @param interaction LLM configuration and context
+     * @param outputClass The target class for object deserialization
+     * @param llmRequestEvent Optional event for tracking/observability
+     * @return Flux of typed objects, thinking content filtered out
+     */
+    override fun <O> doTransformObjectStream(
+        messages: List<Message>,
+        interaction: LlmInteraction,
+        outputClass: Class<O>,
+        llmRequestEvent: LlmRequestEvent<O>?,
+        agentProcess: AgentProcess?,
+        action: Action?,
+    ): Flux<O> {
+        return doTransformObjectStreamInternal(
+            messages = messages,
+            interaction = interaction,
+            outputClass = outputClass,
+            llmRequestEvent = llmRequestEvent,
+            agentProcess = agentProcess,
+            action = action,
+        )
+            .filter { it.isObject() }
+            .map { (it as StreamingEvent.Object).item }
+    }
+
+    /**
+     * Creates a mixed stream containing both LLM thinking content and typed objects.
+     *
+     * This method returns the full unified stream without filtering, allowing users to receive
+     * both thinking events (LLM reasoning) and object events (parsed JSON data) in the order
+     * they appear in the LLM response.
+     *
+     * **Stream Characteristics:**
+     * - **Input**: Raw LLM chunks containing JSONL + thinking content
+     * - **Processing**: Chunks → Lines → Events (both thinking and objects preserved)
+     * - **Output**: `Flux<StreamingEvent<O>>` with mixed content
+     * - **Event Types**: `StreamingEvent.Thinking(content)` and `StreamingEvent.Object(data)`
+     * - **Error Handling**: Malformed JSON treated as thinking content; stream continues
+     *
+     * **Example Usage:**
+     * ```kotlin
+     * val mixedStream: Flux<StreamingEvent<User>> = doTransformObjectStreamWithThinking(...)
+     *
+     * mixedStream.subscribe { event ->
+     *     when {
+     *         event.isThinking() -> println("LLM thinking: ${event.getThinking()}")
+     *         event.isObject() -> println("User object: ${event.getObject()}")
+     *     }
+     * }
+     * ```
+     *
+     * **User Filtering Options:**
+     * ```kotlin
+     * // Get only thinking content:
+     * val thinkingOnly = mixedStream.filter { it.isThinking() }.map { it.getThinking()!! }
+     *
+     * // Get only objects (equivalent to doTransformObjectStream):
+     * val objectsOnly = mixedStream.filter { it.isObject() }.map { it.getObject()!! }
+     * ```
+     *
+     * @param messages The conversation messages to send to LLM
+     * @param interaction LLM configuration and context
+     * @param outputClass The target class for object deserialization
+     * @param llmRequestEvent Optional event for tracking/observability
+     * @return Flux of StreamingEvent<O> containing both thinking and object events
+     */
+    override fun <O> doTransformObjectStreamWithThinking(
+        messages: List<Message>,
+        interaction: LlmInteraction,
+        outputClass: Class<O>,
+        llmRequestEvent: LlmRequestEvent<O>?,
+        agentProcess: AgentProcess?,
+        action: Action?,
+    ): Flux<StreamingEvent<O>> {
+        return doTransformObjectStreamInternal(
+            messages = messages,
+            interaction = interaction,
+            outputClass = outputClass,
+            llmRequestEvent = llmRequestEvent,
+            agentProcess = agentProcess,
+            action = action,
+        )
+    }
+
+    /**
+     * Internal unified streaming implementation - workhorse -that handles the complete transformation pipeline.
+     *
+     * This method implements a robust 3-step transformation pipeline:
+     * 1. **Raw LLM Chunks**: Receives arbitrary-sized chunks from LLM via Spring AI ChatClient
+     * 2. **Line Buffering**: Accumulates chunks into complete logical lines using stateful LineBuffer
+     * 3. **Event Generation**: Classifies lines as thinking vs objects, converts to StreamingEvent<O>
+     *
+     * **Design Principles:**
+     * - **Single Source of Truth**: All streaming logic centralized here
+     * - **Error Isolation**: Malformed lines don't break the entire stream
+     * - **Order Preservation**: Events maintain LLM response order via concatMap
+     * - **Backpressure Support**: Full Flux lifecycle support with reactive operators
+     *
+     * **Event Types Generated:**
+     * - `StreamingEvent.Thinking(content)`: LLM reasoning text (from `<think>` blocks or prefix thinking)
+     * - `StreamingEvent.Object(data)`: Parsed typed objects from JSONL content
+     *
+     * **Error Handling Strategy:**
+     * - Chunk processing errors: Skip chunk, continue stream
+     * - Line classification errors: Treat as thinking content
+     * - JSON parsing errors: Skip line, continue processing
+     * - Stream continues on individual failures to maximize data recovery
+     *
+     * **Performance Characteristics:**
+     * - Streaming-friendly: no blocking operations
+     *
+     * @return Unified Flux<StreamingEvent<O>> that public methods can filter as needed
+     */
+    private fun <O> doTransformObjectStreamInternal(
+        messages: List<Message>,
+        interaction: LlmInteraction,
+        outputClass: Class<O>,
+        @Suppress("UNUSED_PARAMETER")
+        llmRequestEvent: LlmRequestEvent<O>?,
+        agentProcess: AgentProcess?,
+        action: Action?,
+    ): Flux<StreamingEvent<O>> {
+        // Common setup - delegate to ChatClientLlmOperations for LLM setup
+        val llm = getLlm(interaction)
+        // Chat Client
+        val chatClient = createChatClient(llm)
+        // Chat Options, additional potential option "streaming"
+        val chatOptions = requireSpringAiLlm(llm).optionsConverter.convertOptions(interaction.llm)
+
+        val streamingConverter = StreamingJacksonOutputConverter(
+            clazz = outputClass,
+            objectMapper = objectMapper,
+            fieldFilter = interaction.fieldFilter
+        )
+
+        // Build prompt using helper methods, including streaming format instructions
+        val promptContributions = buildPromptContributions(interaction, llm)
+        val streamingFormatInstructions = streamingConverter.getFormat()
+        logger.debug("STREAMING FORMAT INSTRUCTIONS: $streamingFormatInstructions")
+        val fullPromptContributions = if (promptContributions.isNotEmpty()) {
+            "$promptContributions$PROMPT_ELEMENT_SEPARATOR$streamingFormatInstructions"
+        } else {
+            streamingFormatInstructions
+        }
+        val springAiPrompt = buildBasicPrompt(fullPromptContributions, messages)
+
+        // Guardrails: Pre-validation of user input
+        val userMessages = messages.filterIsInstance<com.embabel.chat.UserMessage>()
+        validateUserInput(userMessages, interaction, llmRequestEvent?.agentProcess?.blackboard)
+
+        // Resolve tool groups and decorate tools
+        val tools = resolveAndDecorateTools(interaction, agentProcess, action)
+
+        // Step 1: Original raw chunk stream from LLM
+        val rawChunkFlux: Flux<String> = createStreamInternal(
+            chatClient = chatClient,
+            messages = messages,
+            promptContributions = fullPromptContributions,
+            tools = tools,
+            chatOptions = chatOptions,
+            springAiPrompt = springAiPrompt,
+        ).filter { it.isNotEmpty() }
+            .doOnNext { chunk -> logger.trace("RAW CHUNK: '${chunk.replace("\n", "\\n")}'") }
+
+        // Step 2: Transform raw chunks to complete newline-delimited lines
+        val lineFlux: Flux<String> = rawChunkFlux
+            .transform { chunkFlux -> rawChunksToLines(chunkFlux) }
+            .doOnNext { line -> logger.trace("COMPLETE LINE: '$line'") }
+
+        // Step 3: Final flux of StreamingEvent (thinking + objects)
+        val event = lineFlux
+            .concatMap { line -> streamingConverter.convertStreamWithThinking(line) }
+
+        return event
+    }
+
+    /**
+     * Convert raw streaming chunks → NDJSON lines
+     * Handles all general cases:
+     * - multiple \n in one chunk
+     * - no \n in chunk
+     * - line spanning many chunks
+     */
+    fun rawChunksToLines(raw: Flux<String>): Flux<String> {
+        val buffer = StringBuilder()
+        return raw.concatMap { chunk ->  // ONLY CHANGE: handle → concatMap
+            buffer.append(chunk)
+            val lines = mutableListOf<String>()
+            while (true) {
+                val idx = buffer.indexOf('\n')
+                if (idx < 0) break
+                val line = buffer.substring(0, idx).trim()
+                if (line.isNotEmpty()) lines.add(line)
+                buffer.delete(0, idx + 1)
+            }
+
+            Flux.fromIterable(lines)  // emit multiple lines
+
+        }.doOnComplete {
+            // Log any remaining buffer content when stream ends
+            if (buffer.isNotEmpty()) {
+                val finalLine = buffer.toString().trim()
+                if (finalLine.isNotEmpty()) {
+                    logger.trace("FINAL LINE: '$finalLine'")
+                }
+            }
+        }.concatWith(
+            // final emit
+            Mono.fromSupplier { buffer.toString().trim() }
+                .filter { it.isNotEmpty() }
+        )
+    }
+
+    /* -------------------------------------------------------------------------
+     * Streaming Abstraction Layer
+     *
+     * Supports decoupling streaming from Spring AI via LlmMessageStreamer interface.
+     * Controlled by useMessageStreamer flag:
+     *   - false (default): uses Spring AI ChatClient directly
+     *   - true: delegates to vendor-neutral LlmMessageStreamer
+     *
+     * Enables future support for non-Spring AI providers (e.g., LangChain4j).
+     * ------------------------------------------------------------------------ */
+
+    /**
+     * Build message list with prompt contributions prepended as system message.
+     *
+     * Mirrors [buildBasicPrompt] but returns Embabel messages instead of Spring AI Prompt.
+     * Used by the decoupled streaming path (when useMessageStreamer=true).
+     *
+     * @param messages Conversation messages
+     * @param promptContributions Prompt contributions to prepend
+     * @return Message list with contributions as first system message (if non-empty)
+     */
+    private fun buildMessagesWithContributions(
+        messages: List<Message>,
+        promptContributions: String,
+    ): List<Message> = buildList {
+        if (promptContributions.isNotEmpty()) {
+            add(com.embabel.chat.SystemMessage(promptContributions))
+        }
+        addAll(messages)
+    }
+
+    /**
+     * Create raw content stream from LLM.
+     *
+     * Switches between decoupled path (LlmMessageStreamer) and current path (Spring AI direct)
+     * based on [useMessageStreamer] flag.
+     *
+     * @param chatClient Spring AI ChatClient instance
+     * @param messages Embabel conversation messages
+     * @param promptContributions Prompt contributions string
+     * @param tools Embabel tools available for LLM
+     * @param chatOptions Spring AI chat options
+     * @param springAiPrompt Pre-built Spring AI prompt (used when useMessageStreamer=false)
+     * @return Flux of raw content chunks
+     */
+    private fun createStreamInternal(
+        chatClient: org.springframework.ai.chat.client.ChatClient,
+        messages: List<Message>,
+        promptContributions: String,
+        tools: List<com.embabel.agent.api.tool.Tool>,
+        chatOptions: org.springframework.ai.chat.prompt.ChatOptions,
+        springAiPrompt: Prompt,
+    ): Flux<String> {
+        return if (useMessageStreamer) {
+            val streamerMessages = buildMessagesWithContributions(messages, promptContributions)
+            SpringAiLlmMessageStreamer(chatClient, chatOptions).stream(streamerMessages, tools)
+        } else {
+            chatClient
+                .prompt(springAiPrompt)
+                .toolCallbacks(tools.toSpringToolCallbacks())
+                .options(chatOptions)
+                .stream()
+                .content()
+        }
+    }
 }
 
 /**

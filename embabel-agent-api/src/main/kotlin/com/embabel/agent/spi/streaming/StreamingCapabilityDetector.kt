@@ -13,15 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.embabel.agent.api.common.support.streaming
+package com.embabel.agent.spi.streaming
 
-import com.embabel.agent.api.common.InteractionId
-import com.embabel.agent.api.common.support.streaming.StreamingCapabilityDetector.supportsStreaming
-import com.embabel.agent.core.internal.LlmOperations
-import com.embabel.agent.core.support.LlmInteraction
-import com.embabel.agent.spi.support.springai.ChatClientLlmOperations
-import com.embabel.agent.spi.support.springai.SpringAiLlmService
-import com.embabel.common.ai.model.LlmOptions
 import com.embabel.common.util.loggerFor
 import org.springframework.ai.chat.messages.UserMessage
 import org.springframework.ai.chat.model.ChatModel
@@ -61,27 +54,6 @@ internal object StreamingCapabilityDetector {
             logger.debug(CACHE_MISS_LOG_MESSAGE, model.javaClass.simpleName)
             testStreamingCapability(model)
         }
-    }
-
-    /**
-     * Delegates to [supportsStreaming]
-     */
-    fun supportsStreaming(llmOperations: LlmOperations, llmOptions: LlmOptions): Boolean {
-
-        // Level 1 sanity check
-        if (llmOperations !is ChatClientLlmOperations) return false
-
-        // Level 2: Must have actual streaming capability
-        val llm = llmOperations.getLlm(
-            LlmInteraction(                 //  check for circular dependency
-                id = InteractionId("capability-check"),
-                llm = llmOptions
-            )
-        )
-
-        val springAiLlm = llm as? SpringAiLlmService ?: return false
-        return supportsStreaming(springAiLlm.chatModel)
-
     }
 
     private fun testStreamingCapability(model: ChatModel): Boolean {

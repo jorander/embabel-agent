@@ -16,9 +16,10 @@
 package com.embabel.agent.test.integration;
 
 import com.embabel.agent.core.AgentPlatform;
-import com.embabel.agent.core.internal.LlmOperations;
 import com.embabel.agent.core.support.LlmInteraction;
+import com.embabel.agent.spi.support.springai.LlmOperationsIncludingStreaming;
 import com.embabel.chat.Message;
+import com.embabel.common.ai.model.LlmOptions;
 import com.embabel.common.ai.model.ModelProvider;
 import org.mockito.ArgumentCaptor;
 import org.mockito.ArgumentMatcher;
@@ -28,11 +29,14 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
+import reactor.core.publisher.Flux;
 
 import java.util.List;
 import java.util.function.Predicate;
 
-import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -58,17 +62,31 @@ public class EmbabelMockitoIntegrationTest {
     private ModelProvider modelProvider;
 
     @MockitoBean
-    protected LlmOperations llmOperations;
+    protected LlmOperationsIncludingStreaming llmOperations;
+
+    protected void supportsStreaming(boolean supportsStreaming) {
+      when(llmOperations.supportsStreaming(any(LlmOptions.class))).thenReturn(supportsStreaming);
+    }
 
     // Stubbing methods
     protected <T> OngoingStubbing<T> whenCreateObject(Predicate<String> promptMatcher, Class<T> outputClass, Predicate<LlmInteraction> llmInteractionPredicate) {
         // Mock the lower level LLM operation to create an object
         // that will ultimately be called
-        return when(llmOperations.createObject(argThat(m -> firstMessageContentSatisfiesMatcher(m, promptMatcher)), argThat(llmInteractionPredicate::test), eq(outputClass), any(), any()));
+      return when(
+                llmOperations.createObject(argThat(m -> firstMessageContentSatisfiesMatcher(m, promptMatcher)), argThat(llmInteractionPredicate::test), eq(outputClass), any(), any()));
     }
 
     protected <T> OngoingStubbing<T> whenCreateObject(Predicate<String> promptMatcher, Class<T> outputClass) {
         return whenCreateObject(promptMatcher, outputClass, llmi -> true);
+    }
+
+    protected <T> OngoingStubbing<Flux<T>> whenCreateObjectStream(Predicate<String> promptMatcher, Class<T> outputClass, Predicate<LlmInteraction> llmInteractionPredicate) {
+        return when(
+                llmOperations.createObjectStream(argThat(m -> firstMessageContentSatisfiesMatcher(m, promptMatcher)), argThat(llmInteractionPredicate::test), eq(outputClass), any(), any()));
+    }
+
+    protected <T> OngoingStubbing<Flux<T>> whenCreateObjectStream(Predicate<String> promptMatcher, Class<T> outputClass) {
+        return whenCreateObjectStream(promptMatcher, outputClass, llmi -> true);
     }
 
     protected OngoingStubbing<String> whenGenerateText(Predicate<String> promptMatcher, Predicate<LlmInteraction> llmInteractionMatcher) {
@@ -78,6 +96,15 @@ public class EmbabelMockitoIntegrationTest {
 
     protected OngoingStubbing<String> whenGenerateText(Predicate<String> promptMatcher) {
         return whenGenerateText(promptMatcher, llmi -> true);
+    }
+
+    protected OngoingStubbing<Flux<String>> whenGenerateStream(Predicate<String> promptMatcher, Predicate<LlmInteraction> llmInteractionMatcher) {
+       return when(llmOperations.generateStream(argThat(m -> firstMessageContentSatisfiesMatcher(m, promptMatcher)),
+                argThat(llmInteractionMatcher::test), any(), any()));
+    }
+
+    protected OngoingStubbing<Flux<String>> whenGenerateStream(Predicate<String> promptMatcher) {
+        return whenGenerateStream(promptMatcher, llmi -> true);
     }
 
     // Verification methods
@@ -90,12 +117,29 @@ public class EmbabelMockitoIntegrationTest {
         verifyCreateObject(prompt, outputClass, llmi -> true);
     }
 
+    protected <T> void verifyCreateObjectStream(Predicate<String> promptMatcher, Class<T> outputClass, Predicate<LlmInteraction> llmInteractionMatcher) {
+        verify(llmOperations).createObjectStream(argThat(m -> firstMessageContentSatisfiesMatcher(m, promptMatcher)),
+                argThat(llmInteractionMatcher::test), eq(outputClass), any(), any());
+    }
+
+    protected <T> void verifyCreateObjectStream(Predicate<String> prompt, Class<T> outputClass) {
+        verifyCreateObjectStream(prompt, outputClass, llmi -> true);
+    }
+
     protected void verifyGenerateText(Predicate<String> promptMatcher, Predicate<LlmInteraction> llmInteractionMatcher) {
         verify(llmOperations).createObject(argThat(m -> firstMessageContentSatisfiesMatcher(m, promptMatcher)), argThat(llmInteractionMatcher::test), eq(String.class), any(), any());
     }
 
     protected void verifyGenerateText(Predicate<String> promptMatcher) {
         verifyGenerateText(promptMatcher, llmi -> true);
+    }
+
+    protected void verifyGenerateStream(Predicate<String> promptMatcher, Predicate<LlmInteraction> llmInteractionMatcher) {
+        verify(llmOperations).generateStream(argThat(m -> firstMessageContentSatisfiesMatcher(m, promptMatcher)), argThat(llmInteractionMatcher::test), any(), any());
+    }
+
+    protected void verifyGenerateStream(Predicate<String> promptMatcher) {
+        verifyGenerateStream(promptMatcher, llmi -> true);
     }
 
     // Verification methods with argument matchers
@@ -109,13 +153,32 @@ public class EmbabelMockitoIntegrationTest {
                 eq(outputClass), any(), any());
     }
 
+    protected <T> void verifyCreateObjectStreamMatching(Predicate<String> promptMatcher, Class<T> outputClass, ArgumentMatcher<LlmInteraction> llmInteractionMatcher) {
+        verify(llmOperations).createObjectStream(argThat(m -> firstMessageContentSatisfiesMatcher(m, promptMatcher)), argThat(llmInteractionMatcher), eq(outputClass), any(), any());
+    }
+
+    protected <T> void verifyCreateObjectStreamMatchingMessages(ArgumentMatcher<List<Message>> promptMatcher, Class<T> outputClass, ArgumentMatcher<LlmInteraction> llmInteractionMatcher) {
+        verify(llmOperations).createObjectStream(argThat(promptMatcher),
+                argThat(llmInteractionMatcher),
+                eq(outputClass), any(), any());
+    }
+
     protected void verifyGenerateTextMatching(Predicate<String> promptMatcher) {
         verify(llmOperations).createObject(argThat(messages -> firstMessageContentSatisfiesMatcher(messages, promptMatcher)), any(), eq(String.class), any(), any());
     }
 
-    protected void verifyGenerateTextMatching(Predicate<String> promptMatcher,
-                                              LlmInteraction llmInteraction) {
-        Mockito.verify(llmOperations).createObject(argThat(messages -> firstMessageContentSatisfiesMatcher(messages, promptMatcher)), eq(llmInteraction), eq(String.class), any(), any());
+    protected void verifyGenerateTextMatching(Predicate<String> promptMatcher, LlmInteraction llmInteraction) {
+        Mockito.verify(llmOperations)
+                .createObject(argThat(messages -> firstMessageContentSatisfiesMatcher(messages, promptMatcher)), eq(llmInteraction), eq(String.class), any(), any());
+    }
+
+    protected void verifyGenerateStreamMatching(Predicate<String> promptMatcher) {
+        verify(llmOperations).generateStream(argThat(messages -> firstMessageContentSatisfiesMatcher(messages, promptMatcher)), any(), any(), any());
+    }
+
+    protected void verifyGenerateStreamMatching(Predicate<String> promptMatcher, LlmInteraction llmInteraction) {
+        Mockito.verify(llmOperations)
+                .generateStream(argThat(messages -> firstMessageContentSatisfiesMatcher(messages, promptMatcher)), eq(llmInteraction), any(), any());
     }
 
     // Convenience verification methods

@@ -19,7 +19,6 @@ import com.embabel.agent.api.common.*
 import com.embabel.agent.api.common.nested.support.PromptRunnerCreating
 import com.embabel.agent.api.common.nested.support.PromptRunnerRendering
 import com.embabel.agent.api.common.streaming.StreamingPromptRunner
-import com.embabel.agent.api.common.support.streaming.StreamingCapabilityDetector
 import com.embabel.agent.api.common.support.streaming.StreamingImpl
 import com.embabel.agent.api.common.thinking.support.ThinkingPromptRunnerOperationsImpl
 import com.embabel.agent.api.tool.Tool
@@ -35,8 +34,8 @@ import com.embabel.agent.core.support.LlmInteraction
 import com.embabel.agent.core.support.safelyGetTools
 import com.embabel.agent.experimental.primitive.Determination
 import com.embabel.agent.spi.loop.ToolNotFoundPolicy
+import com.embabel.agent.spi.streaming.StreamingLlmOperations
 import com.embabel.agent.spi.support.springai.ChatClientLlmOperations
-import com.embabel.agent.spi.support.springai.streaming.StreamingChatClientOperations
 import com.embabel.chat.ImagePart
 import com.embabel.chat.Message
 import com.embabel.chat.UserMessage
@@ -275,14 +274,16 @@ internal data class OperationContextPromptRunner(
     /**
      * Check if streaming is supported by the underlying LLM model.
      * Performs three-level capability detection:
-     * 1. Must be ChatClientLlmOperations for Spring AI integration
+     * 1. Must implement StreamingLlmOperations
      * 2. Must have StreamingChatModel
      */
     override fun supportsStreaming(): Boolean {
         val llmOperations = context.agentPlatform().platformServices.llmOperations
 
+        // Level 1 sanity check
+        if (llmOperations !is StreamingLlmOperations) return false
 
-        return StreamingCapabilityDetector.supportsStreaming(llmOperations, this.llm)
+        return llmOperations.supportsStreaming(this.llm)
     }
 
     override fun streaming(): StreamingPromptRunner.Streaming {
@@ -297,9 +298,7 @@ internal data class OperationContextPromptRunner(
         }
 
         return StreamingImpl(
-            streamingLlmOperations = StreamingChatClientOperations(
-                context.agentPlatform().platformServices.llmOperations as ChatClientLlmOperations
-            ),
+            streamingLlmOperations = context.agentPlatform().platformServices.llmOperations as StreamingLlmOperations,
             interaction = LlmInteraction(
                 llm = llm,
                 toolGroups = toolGroups,

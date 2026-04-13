@@ -20,10 +20,8 @@ import com.embabel.agent.core.AgentPlatform
 import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.Operation
 import com.embabel.agent.core.internal.LlmOperations
-import com.embabel.agent.core.support.LlmInteraction
 import com.embabel.agent.spi.streaming.StreamingLlmOperations
-import com.embabel.agent.spi.support.springai.ChatClientLlmOperations
-import com.embabel.agent.spi.support.springai.SpringAiLlmService
+import com.embabel.agent.spi.support.springai.LlmOperationsIncludingStreaming
 import com.embabel.agent.test.integration.DummyObjectCreatingLlmOperations
 import com.embabel.chat.UserMessage
 import com.embabel.common.ai.model.LlmOptions
@@ -31,13 +29,6 @@ import io.mockk.every
 import io.mockk.mockk
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
-import org.springframework.ai.chat.messages.AssistantMessage
-import org.springframework.ai.chat.model.ChatModel
-import org.springframework.ai.chat.model.ChatResponse
-import org.springframework.ai.chat.model.Generation
-import org.springframework.ai.chat.model.StreamingChatModel
-import org.springframework.ai.chat.prompt.Prompt
-import reactor.core.publisher.Flux
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 
@@ -56,22 +47,12 @@ class OperationContextPromptRunnerStreamingTest {
 
     @Test
     fun `should create streaming operations when llmOperations is ChatClientLlmOperations`() {
-        // Given: Mock with ChatClientLlmOperations that implements StreamingLlmOperations AND has StreamingChatModel
-        val mockStreamingChatModel = mockk<ChatModel>(moreInterfaces = arrayOf(StreamingChatModel::class)) {
-            every { stream(any<Prompt>()) } returns Flux.just(
-                ChatResponse(
-                    listOf(Generation(AssistantMessage("streaming response")))
-                )
-            )
-        }
+        // Given: Mock with ChatClientLlmOperations that implements StreamingLlmOperations AND has model supporting streaming
+        val llmOptions = LlmOptions.withModel("test-model-supporting-streaming")
 
-        val mockLlm = mockk<SpringAiLlmService> {
-            every { chatModel } returns mockStreamingChatModel
-        }
-
-        val mockChatClientLlmOperations =
-            mockk<ChatClientLlmOperations>(moreInterfaces = arrayOf(StreamingLlmOperations::class), relaxed = true) {
-                every { getLlm(any<LlmInteraction>()) } returns mockLlm
+        val mockLlmOperationsIncludingStreaming =
+            mockk<LlmOperationsIncludingStreaming>(moreInterfaces = arrayOf(StreamingLlmOperations::class), relaxed = true) {
+                every { supportsStreaming(llmOptions) } returns true
             }
 
         val mockAgentPlatform = mockk<AgentPlatform>()
@@ -85,7 +66,7 @@ class OperationContextPromptRunnerStreamingTest {
         }
 
         val mockPlatformServices = mockk<PlatformServices> {
-            every { llmOperations } returns mockChatClientLlmOperations  // This enables all capability levels
+            every { llmOperations } returns mockLlmOperationsIncludingStreaming  // This enables all capability levels
         }
 
         every { mockAgentPlatform.platformServices } returns mockPlatformServices
@@ -94,7 +75,7 @@ class OperationContextPromptRunnerStreamingTest {
         // Create with real value objects where possible
         val promptRunner = OperationContextPromptRunner(
             context = mockOperationContext,
-            llm = LlmOptions.withModel("test-model"),
+            llm = llmOptions,
             messages = listOf(UserMessage("Test message")),
             toolGroups = emptySet(),
             toolObjects = emptyList(),

@@ -27,8 +27,8 @@ import com.embabel.agent.core.support.InvalidLlmReturnFormatException
 import com.embabel.agent.core.support.InvalidLlmReturnTypeException
 import com.embabel.agent.core.support.LlmInteraction
 import com.embabel.agent.core.support.safelyGetToolsFrom
+import com.embabel.agent.spi.streaming.StreamingLlmOperations
 import com.embabel.agent.spi.support.springai.ChatClientLlmOperations
-import com.embabel.agent.spi.support.MaybeReturn
 import com.embabel.agent.spi.support.springai.SpringAiLlmService
 import com.embabel.agent.spi.validation.DefaultValidationPromptGenerator
 import com.embabel.agent.support.SimpleTestAgent
@@ -48,8 +48,10 @@ import io.mockk.slot
 import jakarta.validation.Validation
 import jakarta.validation.constraints.Pattern
 import org.junit.jupiter.api.Assertions.*
+import org.junit.jupiter.api.Disabled
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
+import org.slf4j.LoggerFactory
 import org.springframework.ai.chat.messages.AssistantMessage
 import org.springframework.ai.chat.model.ChatModel
 import org.springframework.ai.chat.model.ChatResponse
@@ -58,6 +60,9 @@ import org.springframework.ai.chat.prompt.ChatOptions
 import org.springframework.ai.chat.prompt.DefaultChatOptions
 import org.springframework.ai.chat.prompt.Prompt
 import org.springframework.ai.model.tool.ToolCallingChatOptions
+import reactor.core.publisher.Flux
+import reactor.test.StepVerifier
+import java.time.Duration
 import java.time.LocalDate
 import java.util.concurrent.Executors
 import java.util.function.Predicate
@@ -104,13 +109,31 @@ class FakeChatModel(
             )
         )
     }
+
+    override fun stream(prompt: Prompt): Flux<ChatResponse?> {
+        promptsPassed.add(prompt)
+        val options = prompt.options as? ToolCallingChatOptions
+            ?: throw IllegalArgumentException("Expected ToolCallingChatOptions")
+        optionsPassed.add(options)
+        return Flux.fromIterable(responses)
+                .map { response ->
+                    ChatResponse(
+                        listOf(
+                            Generation(AssistantMessage(response))
+                        )
+                    )
+                }
+    }
 }
 
 
 class ChatClientLlmOperationsTest {
 
+    private val logger = LoggerFactory.getLogger(ChatClientLlmOperationsTest::class.java)
+
     data class Setup(
         val llmOperations: LlmOperations,
+        val streamingLlmOperations: StreamingLlmOperations,
         val mockAgentProcess: AgentProcess,
         val mutableLlmInvocationHistory: MutableLlmInvocationHistory,
     )
@@ -118,6 +141,7 @@ class ChatClientLlmOperationsTest {
     private fun createChatClientLlmOperations(
         fakeChatModel: FakeChatModel,
         dataBindingProperties: LlmDataBindingProperties = LlmDataBindingProperties(),
+        useMessageStreamer: Boolean = false,
     ): Setup {
         val ese = EventSavingAgenticEventListener()
         val mutableLlmInvocationHistory = MutableLlmInvocationHistory()
@@ -157,8 +181,9 @@ class ChatClientLlmOperationsTest {
             objectMapper = jacksonObjectMapper().registerModule(JavaTimeModule()),
             dataBindingProperties = dataBindingProperties,
             asyncer = ExecutorAsyncer(Executors.newCachedThreadPool()),
+            useMessageStreamer = useMessageStreamer
         )
-        return Setup(cco, mockAgentProcess, mutableLlmInvocationHistory)
+        return Setup(cco, cco, mockAgentProcess, mutableLlmInvocationHistory)
     }
 
     data class Dog(val name: String)
@@ -409,6 +434,398 @@ class ChatClientLlmOperationsTest {
     }
 
     @Nested
+    inner class CreateObjectStream {
+
+        @Test
+        fun `passes correct prompt`() {
+            val duke = Dog("Duke")
+
+            val fakeChatModel = FakeChatModel(jacksonObjectMapper().writeValueAsString(duke))
+
+            val prompt =
+                "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
+            val setup = createChatClientLlmOperations(fakeChatModel)
+            setup.streamingLlmOperations.createObjectStream(
+                messages = listOf(UserMessage(prompt)),
+                interaction = LlmInteraction(
+                    id = InteractionId("id"), llm = LlmOptions()
+                ),
+                outputClass = Dog::class.java,
+                action = SimpleTestAgent.actions.first(),
+                agentProcess = setup.mockAgentProcess,
+            ).blockLast()
+
+            val promptText = fakeChatModel.promptsPassed[0].toString()
+            assertTrue(promptText.contains("\$schema"), "Prompt contains JSON schema")
+            assertTrue(promptText.contains(promptText), "Prompt contains user prompt:\n$promptText")
+        }
+
+        @Test
+        fun `handles ill formed JSON when returning data class`() {
+            val fakeChatModel = FakeChatModel("This ain't no JSON")
+
+            val setup = createChatClientLlmOperations(fakeChatModel)
+            val result = setup.streamingLlmOperations.createObjectStream(
+                messages = listOf(UserMessage("prompt")),
+                interaction = LlmInteraction(
+                    id = InteractionId("id"), llm = LlmOptions()
+                ),
+                outputClass = Dog::class.java,
+                action = SimpleTestAgent.actions.first(),
+                agentProcess = setup.mockAgentProcess,
+            )
+
+            StepVerifier.create(result)
+                .verifyComplete()  // No data returned
+        }
+
+        @Test
+        fun `returns data class`() {
+            val duke = Dog("Duke")
+
+            val fakeChatModel = FakeChatModel(jacksonObjectMapper().writeValueAsString(duke))
+
+            val setup = createChatClientLlmOperations(fakeChatModel)
+            val result = setup.streamingLlmOperations.createObjectStream(
+                messages = listOf(UserMessage("prompt")),
+                interaction = LlmInteraction(
+                    id = InteractionId("id"), llm = LlmOptions()
+                ),
+                outputClass = Dog::class.java,
+                action = SimpleTestAgent.actions.first(),
+                agentProcess = setup.mockAgentProcess,
+            ).blockLast()
+            assertEquals(duke, result)
+        }
+
+        @Test
+        fun `passes JSON few shot example`() {
+            val duke = Dog("Duke")
+
+            val fakeChatModel = FakeChatModel(jacksonObjectMapper().writeValueAsString(duke))
+
+            val setup = createChatClientLlmOperations(fakeChatModel)
+            val result = setup.streamingLlmOperations.createObjectStream(
+                messages = listOf(
+                    UserMessage(
+                        """
+                    Return a dog. Dogs look like this:
+                {
+                    "name": "Duke",
+                    "type": "Dog"
+                }
+                """.trimIndent()
+                    )
+                ),
+                interaction = LlmInteraction(
+                    id = InteractionId("id"), llm = LlmOptions()
+                ),
+                outputClass = Dog::class.java,
+                action = SimpleTestAgent.actions.first(),
+                agentProcess = setup.mockAgentProcess,
+            ).blockLast()
+            assertEquals(duke, result)
+        }
+
+        @Test
+        fun `presents no tools to ChatModel`() {
+            val duke = Dog("Duke")
+
+            val fakeChatModel = FakeChatModel(jacksonObjectMapper().writeValueAsString(duke))
+
+            val setup = createChatClientLlmOperations(fakeChatModel)
+            val result = setup.streamingLlmOperations.createObjectStream(
+                messages = listOf(UserMessage("prompt")),
+                interaction = LlmInteraction(
+                    id = InteractionId("id"), llm = LlmOptions()
+                ),
+                outputClass = Dog::class.java,
+                action = SimpleTestAgent.actions.first(),
+                agentProcess = setup.mockAgentProcess,
+            ).blockLast()
+            assertEquals(duke, result)
+            assertEquals(1, fakeChatModel.promptsPassed.size)
+            val tools = fakeChatModel.optionsPassed[0].toolCallbacks
+            assertEquals(0, tools.size)
+        }
+
+        @Test
+        fun `presents tools to ChatModel via doTransform`() {
+            val duke = Dog("Duke")
+
+            val fakeChatModel = FakeChatModel(jacksonObjectMapper().writeValueAsString(duke))
+
+            // Wumpus's have tools
+            val tools = safelyGetToolsFrom(ToolObject(Wumpus("wumpy")))
+            val setup = createChatClientLlmOperations(fakeChatModel)
+            val result = setup.streamingLlmOperations.doTransformObjectStream(
+                messages = listOf(
+                    SystemMessage("do whatever"),
+                    UserMessage("prompt"),
+                ),
+                interaction = LlmInteraction(
+                    id = InteractionId("id"),
+                    llm = LlmOptions(),
+                    tools = tools,
+                ),
+                outputClass = Dog::class.java,
+                llmRequestEvent = null,
+            ).blockLast()
+            assertEquals(duke, result)
+            assertEquals(1, fakeChatModel.promptsPassed.size)
+            val passedTools = fakeChatModel.optionsPassed[0].toolCallbacks
+            assertEquals(tools.size, passedTools.size, "Must have passed same number of tools")
+            assertEquals(
+                tools.map { it.definition.name }.toSet(),
+                passedTools.map { it.toolDefinition.name() }.toSet(),
+            )
+        }
+
+        @Test
+        fun `presents tools to ChatModel when given multiple messages`() {
+            val duke = Dog("Duke")
+
+            val fakeChatModel = FakeChatModel(jacksonObjectMapper().writeValueAsString(duke))
+
+            // Wumpus's have tools - use native Tool interface
+            val tools = safelyGetToolsFrom(ToolObject(Wumpus("wumpy")))
+            val setup = createChatClientLlmOperations(fakeChatModel)
+            val result = setup.streamingLlmOperations.createObjectStream(
+                messages = listOf(UserMessage("prompt")),
+                interaction = LlmInteraction(
+                    id = InteractionId("id"),
+                    llm = LlmOptions(),
+                    tools = tools,
+                ),
+                outputClass = Dog::class.java,
+                action = SimpleTestAgent.actions.first(),
+                agentProcess = setup.mockAgentProcess,
+            ).blockLast()
+            assertEquals(duke, result)
+            assertEquals(1, fakeChatModel.promptsPassed.size)
+            val passedTools = fakeChatModel.optionsPassed[0].toolCallbacks
+            assertEquals(tools.size, passedTools.size, "Must have passed same number of tools")
+            assertEquals(
+                tools.map { it.definition.name }.sorted(),
+                passedTools.map { it.toolDefinition.name() })
+        }
+
+        @Test
+        fun `handles reasoning model return`() {
+            val duke = Dog("Duke")
+
+            val fakeChatModel = FakeChatModel(
+                "<think>Deep thoughts</think>\n" + jacksonObjectMapper().writeValueAsString(duke)
+            )
+
+            val setup = createChatClientLlmOperations(fakeChatModel)
+            val result = setup.streamingLlmOperations.createObjectStream(
+                messages = listOf(UserMessage("prompt")),
+                interaction = LlmInteraction(
+                    id = InteractionId("id"), llm = LlmOptions()
+                ),
+                outputClass = Dog::class.java,
+                action = SimpleTestAgent.actions.first(),
+                agentProcess = setup.mockAgentProcess,
+            ).blockLast()
+            assertEquals(duke, result)
+        }
+
+        @Test
+        fun `handles LocalDate return`() {
+            val duke = TemporalDog("Duke", birthDate = LocalDate.of(2021, 2, 26))
+
+            val fakeChatModel = FakeChatModel(
+                jacksonObjectMapper().registerModule(JavaTimeModule()).writeValueAsString(duke)
+            )
+
+            val setup = createChatClientLlmOperations(fakeChatModel)
+            val result = setup.streamingLlmOperations.createObjectStream(
+                messages = listOf(UserMessage("prompt")),
+                interaction = LlmInteraction(
+                    id = InteractionId("id"), llm = LlmOptions()
+                ),
+                outputClass = TemporalDog::class.java,
+                action = SimpleTestAgent.actions.first(),
+                agentProcess = setup.mockAgentProcess,
+            ).blockLast()
+            assertEquals(duke, result)
+        }
+    }
+
+    data class TestItem(val name: String, val value: Int)
+
+    @Nested
+    inner class CreateObjectStreamWithThinking {
+
+        @Test
+        fun `should handle single complete chunk`() {
+            val fakeChatModel = FakeChatModel("<think>This is thinking content</think>\n")
+            val setup = createChatClientLlmOperations(fakeChatModel)
+
+            // When
+            val result = setup.streamingLlmOperations.createObjectStreamWithThinking(
+                messages = listOf(UserMessage("test")),
+                interaction = LlmInteraction(
+                    id = InteractionId("id"), llm = LlmOptions()
+                ),
+                outputClass = TestItem::class.java,
+                action = SimpleTestAgent.actions.first(),
+                agentProcess = setup.mockAgentProcess
+            )
+
+
+            // Then: Should emit one thinking event for the complete line
+            StepVerifier.create(result)
+                .expectNextMatches {
+                    it.isThinking() && it.getThinking() == "This is thinking content"
+                }
+                .expectComplete()
+                .verify(Duration.ofSeconds(1))
+        }
+
+        @Test
+        fun `should handle multi-chunk JSONL object stream`() {
+            // Given: Multiple chunks forming JSONL objects
+            val chunks = listOf(
+                "{\"name\":\"Item1\",\"value\":",
+                "42}\n{\"name\":\"Item2\",",
+                "\"value\":84}\n"
+            )
+            val fakeChatModel = FakeChatModel(chunks)
+            val setup = createChatClientLlmOperations(fakeChatModel)
+
+            // When
+            val result = setup.streamingLlmOperations.createObjectStreamWithThinking(
+                messages = listOf(UserMessage("test")),
+                interaction = LlmInteraction(
+                    id = InteractionId("id"), llm = LlmOptions()
+                ),
+                outputClass = TestItem::class.java,
+                action = SimpleTestAgent.actions.first(),
+                agentProcess = setup.mockAgentProcess
+            )
+
+            // Then: Should emit two object events
+            StepVerifier.create(result)
+                .expectNextMatches {
+                    it.isObject() && it.getObject()?.name == "Item1" && it.getObject()?.value == 42
+                }
+                .expectNextMatches {
+                    it.isObject() && it.getObject()?.name == "Item2" && it.getObject()?.value == 84
+                }
+                .expectComplete()
+                .verify(Duration.ofSeconds(1))
+        }
+
+        @Test
+        fun `should handle mixed thinking and object content in chunks`() {
+            // Given: Realistic chunking that splits thinking and JSON across chunk boundaries
+            val chunks = listOf(
+                "<think>Ana",                  // Partial thinking start
+                "lyzing req",                          // Partial thinking middle
+                "uirement</think>\n{\"name\":",        // Thinking end + partial JSON
+                "\"TestItem\",\"va",                   // Partial JSON middle
+                "lue\":123}\n<think>Done",             // JSON end + partial thinking
+                "</think>\n"                           // Thinking end
+            )
+            val fakeChatModel = FakeChatModel(chunks)
+            val setup = createChatClientLlmOperations(fakeChatModel)
+
+            // When
+            val result = setup.streamingLlmOperations.createObjectStreamWithThinking(
+                messages = listOf(UserMessage("test")),
+                interaction = LlmInteraction(
+                    id = InteractionId("id"), llm = LlmOptions()
+                ),
+                outputClass = TestItem::class.java,
+                action = SimpleTestAgent.actions.first(),
+                agentProcess = setup.mockAgentProcess
+            )
+
+            // Then: Should emit thinking, object, thinking in correct order
+            StepVerifier.create(result)
+                .expectNextMatches {
+                    it.isThinking() && it.getThinking() == "Analyzing requirement"
+                }
+                .expectNextMatches {
+                    it.isObject() && it.getObject()?.name == "TestItem" && it.getObject()?.value == 123
+                }
+                .expectNextMatches {
+                    it.isThinking() && it.getThinking() == "Done"
+                }
+                .expectComplete()
+                .verify(Duration.ofSeconds(1))
+        }
+
+        @Test
+        fun `should handle real streaming with reactive callbacks`() {
+            // Given: Mixed content with multiple events
+            val chunks = listOf(
+                "<think>Processing request</think>\n",
+                "{\"name\":\"Item1\",\"value\":100}\n",
+                "{\"name\":\"Item2\",\"value\":200}\n",
+                "<think>Request completed</think>\n"
+            )
+            val fakeChatModel = FakeChatModel(chunks)
+            val setup = createChatClientLlmOperations(fakeChatModel)
+
+            // When: Subscribe with real reactive callbacks
+            val receivedEvents = mutableListOf<String>()
+            var errorOccurred: Throwable? = null
+            var completionCalled = false
+
+            val result = setup.streamingLlmOperations.createObjectStreamWithThinking(
+                messages = listOf(UserMessage("test")),
+                interaction = LlmInteraction(
+                    id = InteractionId("id"), llm = LlmOptions()
+                ),
+                outputClass = TestItem::class.java,
+                action = SimpleTestAgent.actions.first(),
+                agentProcess = setup.mockAgentProcess
+            )
+
+            result
+                .doOnNext { event ->
+                    when {
+                        event.isThinking() -> {
+                            val content = event.getThinking()!!
+                            receivedEvents.add("THINKING: $content")
+                            logger.info("Received thinking: {}", content)
+                        }
+
+                        event.isObject() -> {
+                            val obj = event.getObject()!!
+                            receivedEvents.add("OBJECT: ${obj.name}=${obj.value}")
+                            logger.info("Received object: {}={}", obj.name, obj.value)
+                        }
+                    }
+                }
+                .doOnError { error ->
+                    errorOccurred = error
+                    logger.error("Stream error: {}", error.message)
+                }
+                .doOnComplete {
+                    completionCalled = true
+                    logger.info("Stream completed successfully")
+                }
+                .subscribe()
+
+            // Give stream time to complete
+            Thread.sleep(500)
+
+            // Then: Verify real reactive behavior
+            assertNull(errorOccurred, "No errors should occur")
+            assertTrue(completionCalled, "Stream should complete successfully")
+            assertEquals(4, receivedEvents.size, "Should receive all events")
+            assertEquals("THINKING: Processing request", receivedEvents[0])
+            assertEquals("OBJECT: Item1=100", receivedEvents[1])
+            assertEquals("OBJECT: Item2=200", receivedEvents[2])
+            assertEquals("THINKING: Request completed", receivedEvents[3])
+        }
+    }
+
+    @Nested
     inner class CreateObjectIfPossible {
 
         @Test
@@ -596,6 +1013,202 @@ class ChatClientLlmOperationsTest {
     }
 
     @Nested
+    inner class CreateObjectStreamIfPossible {
+
+        @Test
+        @Disabled("createObjectStreamIfPossible does not have an implemenation with a specific prompt yet")
+        fun `should have correct prompt with success and failure`() {
+            val fakeChatModel =
+                FakeChatModel(
+                    jacksonObjectMapper().writeValueAsString(
+                        MaybeReturn<Dog>(
+                            failure = "didn't work"
+                        )
+                    )
+                )
+
+            val prompt = "The quick brown fox jumped over the lazy dog"
+            val setup = createChatClientLlmOperations(fakeChatModel)
+            val result = setup.streamingLlmOperations.createObjectStreamIfPossible(
+                messages = listOf(UserMessage(prompt)),
+                interaction = LlmInteraction(
+                    id = InteractionId("id"), llm = LlmOptions()
+                ),
+                outputClass = Dog::class.java,
+                action = SimpleTestAgent.actions.first(),
+                agentProcess = setup.mockAgentProcess,
+            ).blockLast()
+            assertTrue(result!!.isFailure)
+            val promptText = fakeChatModel.promptsPassed[0].toString()
+            assertTrue(promptText.contains("\$schema"), "Prompt contains JSON schema")
+            assertTrue(promptText.contains(promptText), "Prompt contains user prompt:\n$promptText")
+
+            assertTrue(promptText.contains("possible"), "Prompt mentions possible")
+            assertTrue(promptText.contains("success"), "Prompt mentions success")
+            assertTrue(promptText.contains("failure"), "Prompt mentions failure")
+        }
+
+        @Test
+        fun `returns data class - success`() {
+            val duke = Dog("Duke")
+
+            val fakeChatModel = FakeChatModel(
+                jacksonObjectMapper().writeValueAsString(duke)
+            )
+
+            val setup = createChatClientLlmOperations(fakeChatModel)
+            val result = setup.streamingLlmOperations.createObjectStreamIfPossible(
+                messages = listOf(UserMessage("prompt")),
+                interaction = LlmInteraction(
+                    id = InteractionId("id"), llm = LlmOptions()
+                ),
+                outputClass = Dog::class.java,
+                action = SimpleTestAgent.actions.first(),
+                agentProcess = setup.mockAgentProcess,
+            ).blockLast()
+            assertEquals(duke, result!!.getOrThrow())
+        }
+
+        @Test
+        fun `handles reasoning model success return`() {
+            val duke = Dog("Duke")
+
+            val fakeChatModel = FakeChatModel(
+                "<think>More deep thoughts</think>\n" + jacksonObjectMapper().writeValueAsString(duke)
+            )
+
+            val setup = createChatClientLlmOperations(fakeChatModel)
+            val result = setup.streamingLlmOperations.createObjectStreamIfPossible(
+                messages = listOf(UserMessage("prompt")),
+                interaction = LlmInteraction(
+                    id = InteractionId("id"), llm = LlmOptions()
+                ),
+                outputClass = Dog::class.java,
+                action = SimpleTestAgent.actions.first(),
+                agentProcess = setup.mockAgentProcess,
+            ).blockLast()
+            assertEquals(duke, result!!.getOrThrow())
+        }
+
+        @Test
+        fun `handles LocalDate return`() {
+            val duke = TemporalDog("Duke", birthDate = LocalDate.of(2021, 2, 26))
+
+            val fakeChatModel = FakeChatModel(
+                jacksonObjectMapper().registerModule(JavaTimeModule()).writeValueAsString(duke)
+            )
+
+            val setup = createChatClientLlmOperations(fakeChatModel)
+            val result = setup.streamingLlmOperations.createObjectStreamIfPossible(
+                messages = listOf(UserMessage("prompt")),
+                interaction = LlmInteraction(
+                    id = InteractionId("id"), llm = LlmOptions()
+                ),
+                outputClass = TemporalDog::class.java,
+                action = SimpleTestAgent.actions.first(),
+                agentProcess = setup.mockAgentProcess,
+            ).blockLast()
+            assertEquals(duke, result!!.getOrThrow())
+        }
+
+        @Test
+        fun `handles ill formed JSON when returning data class`() {
+            val fakeChatModel = FakeChatModel("This ain't no JSON")
+
+            val setup = createChatClientLlmOperations(fakeChatModel)
+            val result = setup.streamingLlmOperations.createObjectStreamIfPossible(
+                messages = listOf(UserMessage("prompt")),
+                interaction = LlmInteraction(
+                    id = InteractionId("id"), llm = LlmOptions()
+                ),
+                outputClass = Dog::class.java,
+                action = SimpleTestAgent.actions.first(),
+                agentProcess = setup.mockAgentProcess,
+            )
+
+            StepVerifier.create(result)
+                .verifyComplete() // No data returned
+        }
+
+        @Test
+        fun `returns data class - failure`() {
+            val fakeChatModel =
+                FakeChatModel(
+                    jacksonObjectMapper().writeValueAsString(
+                        MaybeReturn<Dog>(
+                            failure = "didn't work"
+                        )
+                    )
+                )
+
+            val setup = createChatClientLlmOperations(fakeChatModel)
+            val result = setup.streamingLlmOperations.createObjectStreamIfPossible(
+                messages = listOf(UserMessage("prompt")),
+                interaction = LlmInteraction(
+                    id = InteractionId("id"), llm = LlmOptions()
+                ),
+                outputClass = Dog::class.java,
+                action = SimpleTestAgent.actions.first(),
+                agentProcess = setup.mockAgentProcess,
+            ).blockLast()
+            assertTrue(result!!.isFailure)
+        }
+
+        @Test
+        fun `presents tools to ChatModel`() {
+            val duke = Dog("Duke")
+
+            val fakeChatModel = FakeChatModel(
+                jacksonObjectMapper().writeValueAsString(
+                    MaybeReturn(duke)
+                )
+            )
+
+            // Wumpus's have tools - use native Tool interface
+            val tools = safelyGetToolsFrom(ToolObject(Wumpus("wumpy")))
+            val setup = createChatClientLlmOperations(fakeChatModel)
+            setup.streamingLlmOperations.createObjectStreamIfPossible(
+                messages = listOf(UserMessage("prompt")),
+                interaction = LlmInteraction(
+                    id = InteractionId("id"),
+                    llm = LlmOptions(),
+                    tools = tools,
+                ),
+                outputClass = Dog::class.java,
+                action = SimpleTestAgent.actions.first(),
+                agentProcess = setup.mockAgentProcess,
+            ).blockLast()
+            assertEquals(1, fakeChatModel.promptsPassed.size)
+            val passedTools = fakeChatModel.optionsPassed[0].toolCallbacks
+            assertEquals(tools.size, passedTools.size, "Must have passed same number of tools")
+            assertEquals(
+                tools.map { it.definition.name }.sorted(),
+                passedTools.map { it.toolDefinition.name() })
+        }
+    }
+
+    @Nested
+    inner class GenerateStream {
+
+        @Test
+        fun `returns string`() {
+            val fakeChatModel = FakeChatModel("fake response")
+
+            val setup = createChatClientLlmOperations(fakeChatModel)
+            val result = setup.streamingLlmOperations.generateStream(
+                messages = listOf(UserMessage("prompt")),
+                interaction = LlmInteraction(
+                    id = InteractionId("id"), llm = LlmOptions()
+                ),
+                action = SimpleTestAgent.actions.first(),
+                agentProcess = setup.mockAgentProcess,
+            ).blockLast()
+
+            assertEquals(fakeChatModel.response, result)
+        }
+    }
+
+    @Nested
     inner class TimeoutBehavior {
 
         /**
@@ -697,7 +1310,7 @@ class ChatClientLlmOperationsTest {
                 llmOperationsPromptsProperties = promptsProperties,
                 asyncer = ExecutorAsyncer(Executors.newCachedThreadPool()),
             )
-            return Setup(cco, mockAgentProcess, mutableLlmInvocationHistory)
+            return Setup(cco, cco, mockAgentProcess, mutableLlmInvocationHistory)
         }
     }
 
@@ -1326,4 +1939,144 @@ class ChatClientLlmOperationsTest {
         }
     }
 
+    /**
+     * Test of lower level internal implementation
+     */
+    @Nested
+    inner class StreamedChunks {
+
+        @Test
+        fun `rawChunksToLines should handle single line chunks`() {
+            val chunks = Flux.just("line1\n", "line2\n")
+
+            val setup = createChatClientLlmOperations(FakeChatModel("fake"))
+            val result = (setup.streamingLlmOperations as ChatClientLlmOperations).rawChunksToLines(chunks)
+
+            StepVerifier.create(result)
+                .expectNext("line1")
+                .expectNext("line2")
+                .verifyComplete()
+        }
+
+        @Test
+        fun `rawChunksToLines should handle multi-line chunks from Anthropic`() {
+            val chunks = Flux.just(".\n</think>\n\n{\"")
+
+            val setup = createChatClientLlmOperations(FakeChatModel("fake"))
+            val result = (setup.streamingLlmOperations as ChatClientLlmOperations).rawChunksToLines(chunks)
+
+            StepVerifier.create(result)
+                .expectNext(".")
+                .expectNext("</think>")
+                .expectNext("{\"")
+                .verifyComplete()
+        }
+
+        @Test
+        fun `rawChunksToLines should handle incomplete lines across chunks`() {
+            val chunks = Flux.just("partial", " line\n", "complete\n")
+
+            val setup = createChatClientLlmOperations(FakeChatModel("fake"))
+            val result = (setup.streamingLlmOperations as ChatClientLlmOperations).rawChunksToLines(chunks)
+
+            StepVerifier.create(result)
+                .expectNext("partial line")
+                .expectNext("complete")
+                .verifyComplete()
+        }
+
+        @Test
+        fun `rawChunksToLines should emit final incomplete line`() {
+            val chunks = Flux.just("line1\n", "incomplete")
+
+            val setup = createChatClientLlmOperations(FakeChatModel("fake"))
+            val result = (setup.streamingLlmOperations as ChatClientLlmOperations).rawChunksToLines(chunks)
+
+            StepVerifier.create(result)
+                .expectNext("line1")
+                .expectNext("incomplete")
+                .verifyComplete()
+        }
+    }
+
+    /**
+     * Tests for useMessageStreamer=true (decoupled streaming path via LlmMessageStreamer).
+     */
+    @Nested
+    inner class MessageStreamerTests {
+
+        @Test
+        fun `should use LlmMessageStreamer when useMessageStreamer is true`() {
+            // Given
+            val fakeChatModel = FakeChatModel(listOf("streamed ", "content"))
+
+            val setup = createChatClientLlmOperations(fakeChatModel, useMessageStreamer = true)
+
+            // When
+            val result = setup.streamingLlmOperations.generateStream(
+                listOf(UserMessage("test")),
+                interaction = LlmInteraction(
+                    id = InteractionId("id"), llm = LlmOptions()
+                ),
+                action = SimpleTestAgent.actions.first(),
+                agentProcess = setup.mockAgentProcess,
+            )
+
+            // Then
+            StepVerifier.create(result)
+                .expectNext("streamed ")
+                .expectNext("content")
+                .verifyComplete()
+        }
+
+        @Test
+        fun `should prepend prompt contributions as system message`() {
+            // Given
+            val fakeChatModel = FakeChatModel(listOf("response"))
+
+            val setup = createChatClientLlmOperations(fakeChatModel, useMessageStreamer = true)
+
+            // When
+            val result = setup.streamingLlmOperations.generateStream(
+                listOf(UserMessage("user message")),
+                interaction = LlmInteraction(
+                    id = InteractionId("id"), llm = LlmOptions()
+                ),
+                action = SimpleTestAgent.actions.first(),
+                agentProcess = setup.mockAgentProcess,
+            )
+
+            // Then
+            StepVerifier.create(result)
+                .expectNext("response")
+                .verifyComplete()
+        }
+
+        @Test
+        fun `should handle object streaming`() {
+            // Given
+            val fakeChatModel = FakeChatModel(listOf("{\"name\":\"Test\",\"value\":42}\n"))
+
+            val setup = createChatClientLlmOperations(fakeChatModel, useMessageStreamer = true)
+
+            // When
+            val result = setup.streamingLlmOperations.createObjectStreamWithThinking(
+                messages = listOf(UserMessage("test")),
+                outputClass = TestItem::class.java,
+                interaction = LlmInteraction(
+                    id = InteractionId("id"), llm = LlmOptions()
+                ),
+                action = SimpleTestAgent.actions.first(),
+                agentProcess = setup.mockAgentProcess,
+            )
+
+            // Then
+            StepVerifier.create(result)
+                .expectNextMatches {
+                    it.isObject() && it.getObject()?.name == "Test" && it.getObject()?.value == 42
+                }
+                .expectComplete()
+                .verify(Duration.ofSeconds(1))
+        }
+    }
 }

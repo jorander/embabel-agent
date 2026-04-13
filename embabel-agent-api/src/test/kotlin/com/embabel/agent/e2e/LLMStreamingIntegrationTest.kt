@@ -21,7 +21,7 @@ import com.embabel.agent.api.common.Ai
 import com.embabel.agent.api.common.autonomy.Autonomy
 import com.embabel.agent.api.common.streaming.StreamingPromptRunner
 import com.embabel.agent.api.common.streaming.asStreaming
-import com.embabel.agent.api.common.support.streaming.StreamingCapabilityDetector
+import com.embabel.agent.spi.streaming.StreamingCapabilityDetector
 import com.embabel.agent.core.AgentPlatform
 import com.embabel.agent.core.internal.LlmOperations
 import com.embabel.agent.spi.LlmService

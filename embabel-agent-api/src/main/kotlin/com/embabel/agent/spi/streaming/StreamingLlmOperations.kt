@@ -20,7 +20,7 @@ import com.embabel.agent.core.Action
 import com.embabel.agent.core.AgentProcess
 import com.embabel.agent.core.support.LlmInteraction
 import com.embabel.chat.Message
-import com.embabel.chat.UserMessage
+import com.embabel.common.ai.model.LlmOptions
 import com.embabel.common.core.streaming.StreamingEvent
 import reactor.core.publisher.Flux
 
@@ -40,26 +40,12 @@ import reactor.core.publisher.Flux
 interface StreamingLlmOperations {
 
     /**
-     * Generate streaming text in the context of an AgentProcess.
-     * Returns a Flux that emits text chunks as they arrive from the LLM.
+     * Tests whether the given chat model actually supports streaming operations.
      *
-     * @param prompt Prompt to generate text from
-     * @param interaction Llm options and tool callbacks to use, plus unique identifier
-     * @param agentProcess Agent process we are running within
-     * @param action Action we are running within if we are running within an action
-     * @return Flux of text chunks as they arrive from the LLM
+     * @param llmOptions LlmOptions to use, including the name of the model to test
+     * @return true if the model supports streaming, false otherwise
      */
-    fun generateStream(
-        prompt: String,
-        interaction: LlmInteraction,
-        agentProcess: AgentProcess,
-        action: Action?,
-    ): Flux<String> = generateStream(
-        messages = listOf(UserMessage(prompt)),
-        interaction = interaction,
-        agentProcess = agentProcess,
-        action = action,
-    )
+    fun supportsStreaming(llmOptions: LlmOptions): Boolean
 
     /**
      * Generate streaming text from messages in the context of an AgentProcess.
@@ -76,7 +62,9 @@ interface StreamingLlmOperations {
         interaction: LlmInteraction,
         agentProcess: AgentProcess,
         action: Action?,
-    ): Flux<String>
+    ): Flux<String> {
+        return doTransformStream(messages, interaction, null, agentProcess, action)
+    }
 
     /**
      * Create a streaming list of objects from JSONL response in the context of an AgentProcess.
@@ -98,7 +86,9 @@ interface StreamingLlmOperations {
         outputClass: Class<O>,
         agentProcess: AgentProcess,
         action: Action?,
-    ): Flux<O>
+    ): Flux<O> {
+        return doTransformObjectStream(messages, interaction, outputClass, null, agentProcess, action)
+    }
 
     /**
      * Try to create a streaming list of objects in the context of an AgentProcess.
@@ -118,7 +108,13 @@ interface StreamingLlmOperations {
         outputClass: Class<O>,
         agentProcess: AgentProcess,
         action: Action?,
-    ): Flux<Result<O>>
+    ): Flux<Result<O>> {
+        return createObjectStream(messages, interaction, outputClass, agentProcess, action)
+            .map { Result.success(it) }
+            .onErrorResume { throwable ->
+                Flux.just(Result.failure(throwable))
+            }
+    }
 
     /**
      * Create a streaming list of objects with LLM thinking content from mixed JSONL response.
@@ -141,7 +137,9 @@ interface StreamingLlmOperations {
         outputClass: Class<O>,
         agentProcess: AgentProcess,
         action: Action?,
-    ): Flux<StreamingEvent<O>>
+    ): Flux<StreamingEvent<O>> {
+        return doTransformObjectStreamWithThinking(messages, interaction, outputClass, null, agentProcess, action)
+    }
 
     /**
      * Low level streaming transform with optional platform context.
